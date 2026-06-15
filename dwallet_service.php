@@ -22,7 +22,7 @@
  *   http://assist.gw.sis1.net/mod/dwallet/v1/api/
  *   http://assist.gw.sis1.net/mod/dwallet/v1/api/?ui
  *
- * @version  3.5.0
+ * @version  3.6.0
  * @base-url http://assist.gw.sis1.net
  * ============================================================================
  */
@@ -80,7 +80,7 @@ const CFG_COA_FEE       = '411001';
 const CFG_COA_EXPENSE   = '511001';
 
 // ── Versi ─────────────────────────────────────────────────────────────────────
-const DWALLET_VERSION   = '3.5.0';
+const DWALLET_VERSION   = '3.6.0';
 const DWALLET_TIMEZONE  = CFG_TIMEZONE;
 
 // ── Alias konstanta internal ──────────────────────────────────────────────────
@@ -1120,14 +1120,29 @@ function apiRefund(): void
 function apiInquiry(): void
 {
     Auth::check();
-    $faktur = trim($_GET['faktur'] ?? '');
-    $ref    = trim($_GET['ref_number'] ?? '');
-    if (!$faktur && !$ref) Res::err("Sertakan 'faktur' atau 'ref_number'.", 422);
+
+    // Terima parameter dari: JSON body (POST), form POST, atau query string GET
+    // → semua path dicover sehingga Authorization header selalu sampai
+    $body   = Req::body();
+    $faktur = trim((string)($body['faktur']     ?? $_GET['faktur']     ?? ''));
+    $ref    = trim((string)($body['ref_number'] ?? $_GET['ref_number'] ?? ''));
+
+    // Bersihkan: jika user kirim placeholder text (misal 'REF-001 (alternatif)')
+    // yang tidak ada di DB, lebih baik pesan error yang jelas
+    if (!$faktur && !$ref)
+        Res::err("Sertakan parameter 'faktur' atau 'ref_number'.", 422);
 
     $trx = $faktur
         ? Trx::byFaktur($faktur)
-        : DB::first("SELECT * FROM dwallet_transactions WHERE ref_number=? ORDER BY id DESC LIMIT 1", [$ref]);
-    if (!$trx) Res::err('Transaksi tidak ditemukan.', 404);
+        : DB::first(
+            "SELECT * FROM dwallet_transactions WHERE ref_number=? ORDER BY id DESC LIMIT 1",
+            [$ref]
+          );
+
+    if (!$trx) {
+        $param = $faktur ? "faktur='$faktur'" : "ref_number='$ref'";
+        Res::err("Transaksi tidak ditemukan ($param).", 404);
+    }
 
     $meta    = json_decode($trx['meta'] ?? '{}', true) ?? [];
     $journal = DB::fetch(
@@ -1136,36 +1151,55 @@ function apiInquiry(): void
         [$trx['faktur']]
     );
     Res::ok([
-        'faktur'        => $trx['faktur'],       'jenis'        => $trx['jenis'],
-        'ref_number'    => $trx['ref_number'],   'kode_sender'  => $trx['kode_sender'],
-        'kode_receiver' => $trx['kode_receiver'],'amount'       => (float)$trx['amount'],
-        'fee'           => (float)$trx['fee'],   'gross_amount' => (float)$trx['gross_amount'],
-        'keterangan'    => $trx['keterangan'],   'status'       => statusLabel($trx['status']),
-        'status_kode'   => $trx['status'],       'note'         => $trx['note'],
-        'meta'          => $meta,                'journal'      => $journal,
-        'created_at'    => $trx['created_at'],   'updated_at'   => $trx['updated_at'],
+        'faktur'        => $trx['faktur'],
+        'jenis'         => $trx['jenis'],
+        'ref_number'    => $trx['ref_number'],
+        'kode_sender'   => $trx['kode_sender'],
+        'kode_receiver' => $trx['kode_receiver'],
+        'amount'        => (float)$trx['amount'],
+        'fee'           => (float)$trx['fee'],
+        'gross_amount'  => (float)$trx['gross_amount'],
+        'keterangan'    => $trx['keterangan'],
+        'status'        => statusLabel($trx['status']),
+        'status_kode'   => $trx['status'],
+        'note'          => $trx['note'],
+        'meta'          => $meta,
+        'journal'       => $journal,
+        'created_at'    => $trx['created_at'],
+        'updated_at'    => $trx['updated_at'],
     ]);
 }
 
 function apiHistory(): void
 {
-    $cust   = Auth::check();
-    $code   = $cust['KodePro'] ?: $cust['Kode'];
-    $page   = max(1, (int)($_GET['page'] ?? 1));
-    $pp     = min(100, max(1, (int)($_GET['per_page'] ?? 20)));
-    $jenis  = strtoupper($_GET['jenis'] ?? '');
-    if ($jenis && !in_array($jenis, ['CASHIN','CASHOUT','TRANSFER','PAYMENT','REFUND'], true))
-        Res::err('Jenis tidak valid.', 422);
+    $cust = Auth::check();
+    $code = $cust['KodePro'] ?: $cust['Kode'];
 
-    $res = Trx::history($code, $page, $pp, $jenis ?: null, $_GET['dari'] ?? null, $_GET['sampai'] ?? null);
+    // Terima parameter dari body (POST/JSON) ATAU query string (GET backward compat)
+    $body    = Req::body();
+    $page    = max(1,   (int)(  $body['page']     ?? $_GET['page']     ?? 1));
+    $pp      = min(100, max(1, (int)($body['per_page'] ?? $_GET['per_page'] ?? 20)));
+    $jenis   = strtoupper(trim((string)($body['jenis']   ?? $_GET['jenis']   ?? '')));
+    $dari    = trim((string)($body['dari']    ?? $_GET['dari']    ?? ''));
+    $sampai  = trim((string)($body['sampai']  ?? $_GET['sampai']  ?? ''));
+
+    if ($jenis && !in_array($jenis, ['CASHIN','CASHOUT','TRANSFER','PAYMENT','REFUND'], true))
+        Res::err("Jenis '$jenis' tidak valid. Pilih: CASHIN, CASHOUT, TRANSFER, PAYMENT, REFUND.", 422);
+
+    $res = Trx::history($code, $page, $pp, $jenis ?: null, $dari ?: null, $sampai ?: null);
     $res['data'] = array_map(fn($row) => [
-        'faktur'       => $row['faktur'],      'jenis'        => $row['jenis'],
+        'faktur'       => $row['faktur'],
+        'jenis'        => $row['jenis'],
         'arah'         => $row['kode_sender'] === $code ? 'KELUAR' : 'MASUK',
         'lawan_kode'   => $row['kode_sender'] === $code ? $row['kode_receiver'] : $row['kode_sender'],
-        'amount'       => (float)$row['amount'], 'fee' => (float)$row['fee'],
-        'gross_amount' => (float)$row['gross_amount'], 'keterangan' => $row['keterangan'],
-        'ref_number'   => $row['ref_number'],  'status'      => statusLabel($row['status']),
-        'status_kode'  => $row['status'],      'created_at'  => $row['created_at'],
+        'amount'       => (float)$row['amount'],
+        'fee'          => (float)$row['fee'],
+        'gross_amount' => (float)$row['gross_amount'],
+        'keterangan'   => $row['keterangan'],
+        'ref_number'   => $row['ref_number'],
+        'status'       => statusLabel($row['status']),
+        'status_kode'  => $row['status'],
+        'created_at'   => $row['created_at'],
     ], $res['data']);
     Res::ok($res);
 }
@@ -1353,18 +1387,18 @@ function apiInstall(): void
 if ($DWALLET_IS_API) {
     $method = Req::method();
     $map = [
-        'balance'  => ['apiBalance',  ['GET','POST']],
-        'cashin'   => ['apiCashIn',   ['POST']],
-        'cashout'  => ['apiCashOut',  ['POST']],
-        'transfer' => ['apiTransfer', ['POST']],
-        'payment'  => ['apiPayment',  ['POST']],
-        'refund'   => ['apiRefund',   ['POST']],
-        'inquiry'  => ['apiInquiry',  ['GET','POST']],
-        'history'  => ['apiHistory',  ['GET','POST']],
-        'callback' => ['apiCallback', ['POST']],
-        'health'   => ['apiHealth',   ['GET','POST']],
+        'balance'   => ['apiBalance',   ['GET','POST']],
+        'cashin'    => ['apiCashIn',    ['POST']],
+        'cashout'   => ['apiCashOut',   ['POST']],
+        'transfer'  => ['apiTransfer',  ['POST']],
+        'payment'   => ['apiPayment',   ['POST']],
+        'refund'    => ['apiRefund',    ['POST']],
+        'inquiry'   => ['apiInquiry',   ['GET','POST']],  // GET for backward compat
+        'history'   => ['apiHistory',   ['GET','POST']],  // GET for backward compat
+        'callback'  => ['apiCallback',  ['POST']],
+        'health'    => ['apiHealth',    ['GET','POST']],
         'install'   => ['apiInstall',   ['GET','POST']],
-        'customers' => ['apiCustomers', ['GET']],
+        'customers' => ['apiCustomers', ['GET','POST']],
     ];
     // Endpoint 'customers' boleh dipanggil langsung dari browser tanpa Bearer
     // (data sudah di-embed di HTML, endpoint ini hanya fallback/debug)
@@ -1902,7 +1936,7 @@ pre.api{background:#0f172a;color:#e2e8f0;padding:14px;border-radius:8px;font-siz
 <!-- ══ INQUIRY ══ -->
 <div id="sec-inquiry" class="sec">
   <div class="card"><div class="ch"><h3>🔍 Inquiry Status Transaksi</h3></div><div class="cb">
-    <div class="al al-blue">📡 GET <code><?= htmlspecialchars($baseUrl) ?>?action=inquiry&amp;faktur=xxx</code></div>
+    <div class="al al-blue">📡 POST <code><?= htmlspecialchars($baseUrl) ?>?action=inquiry</code> — body: <code>{"faktur":"xxx"}</code> atau <code>{"ref_number":"xxx"}</code></div>
     <div class="fg">
       <div class="fl full"><label>Bearer Token *</label><input id="iq-tok" placeholder="api_token customer"></div>
       <div class="fl"><label>Nomor Faktur</label><input id="iq-fak" placeholder="CIN0000000001"></div>
@@ -1916,7 +1950,7 @@ pre.api{background:#0f172a;color:#e2e8f0;padding:14px;border-radius:8px;font-siz
 <!-- ══ HISTORY ══ -->
 <div id="sec-history" class="sec">
   <div class="card"><div class="ch"><h3>📜 Riwayat Transaksi</h3></div><div class="cb">
-    <div class="al al-blue">📡 GET <code><?= htmlspecialchars($baseUrl) ?>?action=history</code></div>
+    <div class="al al-blue">📡 POST <code><?= htmlspecialchars($baseUrl) ?>?action=history</code> — body: <code>{"page":1,"per_page":20,"jenis":"CASHIN"}</code></div>
     <div class="fg">
       <div class="fl full"><label>Bearer Token *</label><input id="hs-tok" placeholder="api_token customer"></div>
       <div class="fl"><label>Jenis</label>
@@ -2092,13 +2126,29 @@ Content-Type: application/json
 // Hanya PAYMENT & CASHIN | Status asal: S atau R
 // Idempoten: satu refund per faktur_asal</pre></div>
 
-    <div id="td-inquiry" class="tc"><pre class="api">GET <?= htmlspecialchars($baseUrl) ?>?action=inquiry&amp;faktur=CIN0000000001
-GET <?= htmlspecialchars($baseUrl) ?>?action=inquiry&amp;ref_number=REF-001
-// Response menyertakan: detail transaksi + dwallet_journal entries</pre></div>
+    <div id="td-inquiry" class="tc"><pre class="api">POST <?= htmlspecialchars($baseUrl) ?>?action=inquiry
+Authorization: Bearer &lt;token&gt;
+Content-Type: application/json
 
-    <div id="td-history" class="tc"><pre class="api">GET <?= htmlspecialchars($baseUrl) ?>?action=history
-  &amp;page=1 &amp;per_page=20 &amp;jenis=CASHIN
-  &amp;dari=2025-06-01 &amp;sampai=2025-06-30
+// Cari by faktur:
+{ "faktur": "CIN0000000001" }
+
+// Cari by ref_number:
+{ "ref_number": "REF-001" }
+
+// Response menyertakan: detail transaksi + dwallet_journal entries
+// Backward compat: GET ?action=inquiry&amp;faktur=xxx juga masih bisa</pre></div>
+
+    <div id="td-history" class="tc"><pre class="api">POST <?= htmlspecialchars($baseUrl) ?>?action=history
+Authorization: Bearer &lt;token&gt;
+Content-Type: application/json
+{
+  "page": 1, "per_page": 20,
+  "jenis": "CASHIN",
+  "dari": "2025-06-01", "sampai": "2025-06-30"
+}
+// Semua field opsional
+// Backward compat: GET ?action=history&amp;page=1&amp;... juga masih bisa
 // Response: { data:[...], total, page, per_page, total_page }</pre></div>
 
     <div id="td-callback" class="tc"><pre class="api">POST <?= htmlspecialchars($baseUrl) ?>?action=callback
@@ -2265,8 +2315,25 @@ async function call(action) {
   else if (action === 'transfer')  { token = getToken('tf-tok'); body = { amount: +g('tf-amt'), kode_penerima: g('tf-kode'), ref_number: g('tf-ref'), keterangan: g('tf-ket') }; }
   else if (action === 'payment')   { token = getToken('py-tok'); body = { amount: +g('py-amt'), ref_number: g('py-ref'), kode_produk: g('py-prod'), nomor_tujuan: g('py-tuj'), keterangan: g('py-ket') }; }
   else if (action === 'refund')    { token = getToken('rf-tok'); body = { faktur_asal: g('rf-fak'), alasan: g('rf-alasan') }; }
-  else if (action === 'inquiry')   { token = getToken('iq-tok'); method = 'GET'; const f=g('iq-fak'),r=g('iq-ref'); qs = f ? '&faktur='+encodeURIComponent(f) : '&ref_number='+encodeURIComponent(r); }
-  else if (action === 'history')   { token = getToken('hs-tok'); method = 'GET'; const p = new URLSearchParams(); if(g('hs-page')) p.set('page',g('hs-page')); if(g('hs-pp')) p.set('per_page',g('hs-pp')); if(g('hs-jenis')) p.set('jenis',g('hs-jenis')); if(g('hs-dari')) p.set('dari',g('hs-dari')); if(g('hs-sampai')) p.set('sampai',g('hs-sampai')); qs = '&'+p.toString(); }
+  else if (action === 'inquiry') {
+    token = getToken('iq-tok');
+    // POST dengan JSON body agar Authorization header tidak di-strip proxy
+    const f = g('iq-fak'), r = g('iq-ref');
+    if (!f && !r) { showResult('inquiry', { error: "Isi 'Nomor Faktur' atau 'Ref Number'." }, false); return; }
+    body = {};
+    if (f) body.faktur     = f;
+    if (r) body.ref_number = r;
+  }
+  else if (action === 'history') {
+    token = getToken('hs-tok');
+    // POST dengan JSON body
+    body = {};
+    if (g('hs-page'))   body.page     = +g('hs-page');
+    if (g('hs-pp'))     body.per_page = +g('hs-pp');
+    if (g('hs-jenis'))  body.jenis    = g('hs-jenis');
+    if (g('hs-dari'))   body.dari     = g('hs-dari');
+    if (g('hs-sampai')) body.sampai   = g('hs-sampai');
+  }
   else if (action === 'health')    { method = 'GET'; }
 
   if (!token && action !== 'health') {
