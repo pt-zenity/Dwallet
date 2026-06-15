@@ -22,7 +22,7 @@
  *   http://assist.gw.sis1.net/mod/dwallet/v1/api/
  *   http://assist.gw.sis1.net/mod/dwallet/v1/api/?ui
  *
- * @version  3.4.0
+ * @version  3.5.0
  * @base-url http://assist.gw.sis1.net
  * ============================================================================
  */
@@ -80,7 +80,7 @@ const CFG_COA_FEE       = '411001';
 const CFG_COA_EXPENSE   = '511001';
 
 // ── Versi ─────────────────────────────────────────────────────────────────────
-const DWALLET_VERSION   = '3.4.0';
+const DWALLET_VERSION   = '3.5.0';
 const DWALLET_TIMEZONE  = CFG_TIMEZONE;
 
 // ── Alias konstanta internal ──────────────────────────────────────────────────
@@ -120,6 +120,11 @@ error_reporting(E_ALL);
 ini_set('display_errors', '0');
 ini_set('log_errors',     '1');
 date_default_timezone_set(DWALLET_TIMEZONE);
+
+// Buffer seluruh output — cegah HTML framework / PHP notice bocor ke JSON response.
+// Untuk API: ob_end_clean() di dispatch, lalu echo JSON bersih.
+// Untuk UI : ob_end_flush() setelah seluruh HTML selesai.
+ob_start();
 
 // ============================================================================
 // ── DETEKSI MODE: API vs WEB UI ─────────────────────────────────────────────
@@ -167,14 +172,56 @@ $DWALLET_IS_API = in_array($DWALLET_ACTION, $DWALLET_API_ACTIONS, true);
 
 // ── Untuk API: set header JSON sekarang ──────────────────────────────────────
 if ($DWALLET_IS_API) {
+    // Pastikan semua output framework/notice yang sudah terbuffer dibuang
+    while (ob_get_level() > 0) ob_end_clean();
+    ob_start(); // mulai buffer bersih khusus API
+
     header('Content-Type: application/json; charset=utf-8');
     header('X-DWallet-Version: ' . DWALLET_VERSION);
+    header('X-DWallet-Action: ' . $DWALLET_ACTION);
     header('Access-Control-Allow-Origin: *');
     header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
     header('Access-Control-Allow-Headers: Authorization, Content-Type, X-Request-ID, X-Callback-Signature');
     if (strtoupper($_SERVER['REQUEST_METHOD'] ?? '') === 'OPTIONS') {
-        http_response_code(204); exit;
+        ob_end_clean(); http_response_code(204); exit;
     }
+
+    // Set handler error global: tangkap semua PHP error jadi JSON
+    set_error_handler(function(int $errno, string $errstr, string $errfile, int $errline): bool {
+        // Hanya tangkap error serius
+        if (!($errno & (E_ERROR | E_PARSE | E_CORE_ERROR | E_COMPILE_ERROR | E_USER_ERROR | E_RECOVERABLE_ERROR))) {
+            return false; // lewatkan warning/notice ke log biasa
+        }
+        ob_end_clean();
+        http_response_code(500);
+        header('Content-Type: application/json; charset=utf-8');
+        echo json_encode(['success' => false, 'message' => 'PHP Error: ' . $errstr,
+            'detail' => basename($errfile) . ':' . $errline], JSON_UNESCAPED_UNICODE);
+        exit;
+    });
+
+    set_exception_handler(function(Throwable $e): void {
+        ob_end_clean();
+        http_response_code(500);
+        header('Content-Type: application/json; charset=utf-8');
+        echo json_encode(['success' => false, 'message' => 'Unhandled: ' . $e->getMessage(),
+            'detail' => basename($e->getFile()) . ':' . $e->getLine()], JSON_UNESCAPED_UNICODE);
+        exit;
+    });
+
+    register_shutdown_function(function(): void {
+        $err = error_get_last();
+        if ($err && ($err['type'] & (E_ERROR | E_PARSE | E_CORE_ERROR | E_COMPILE_ERROR))) {
+            $leaked = ob_get_clean() ?: '';
+            http_response_code(500);
+            header('Content-Type: application/json; charset=utf-8');
+            echo json_encode(['success' => false,
+                'message' => 'Fatal: ' . $err['message'],
+                'detail'  => basename($err['file']) . ':' . $err['line'],
+                'leaked'  => $leaked !== '' ? substr($leaked, 0, 500) : null,
+            ], JSON_UNESCAPED_UNICODE);
+        }
+    });
 }
 
 // ============================================================================
@@ -253,13 +300,38 @@ final class Req
 {
     private static ?array $body = null;
 
+    // Cache raw input di property statis agar bisa dibaca ulang
+    private static string $rawInput = '';
+
+    public static function rawInput(): string
+    {
+        if (self::$rawInput === '' && self::$body === null) {
+            self::$rawInput = file_get_contents('php://input') ?: '';
+        }
+        return self::$rawInput;
+    }
+
     public static function body(): array
     {
         if (self::$body === null) {
-            $raw = file_get_contents('php://input') ?: '';
-            // Coba JSON dulu, fallback ke $_POST
-            $decoded = json_decode($raw, true);
-            self::$body = is_array($decoded) ? $decoded : ($_POST ?: []);
+            $raw     = self::rawInput();
+            $ct      = strtolower($_SERVER['CONTENT_TYPE'] ?? '');
+            // Prioritas: JSON body → form POST → empty
+            $decoded = null;
+            if (str_contains($ct, 'application/json') || ($raw !== '' && $raw[0] === '{')) {
+                $decoded = json_decode($raw, true);
+            }
+            if (is_array($decoded) && !empty($decoded)) {
+                self::$body = $decoded;
+            } elseif (!empty($_POST)) {
+                self::$body = $_POST;
+            } elseif ($raw !== '') {
+                // Last resort: coba decode apapun yang ada
+                $decoded = json_decode($raw, true);
+                self::$body = is_array($decoded) ? $decoded : [];
+            } else {
+                self::$body = [];
+            }
         }
         return self::$body;
     }
@@ -777,59 +849,127 @@ function apiCashOut(): void
 {
     $cust = Auth::check();
     $code = $cust['KodePro'] ?: $cust['Kode'];
-    $v    = V::req('amount', 'ref_number', 'bank_code', 'no_rekening', 'nama_penerima')
-             ->amount('amount', MIN_TRX_AMOUNT, MAX_CASHOUT_AMOUNT);
-    if ($v->fails()) Res::err('Validasi gagal.', 422, $v->errors());
 
-    $amount = (float)$v->get('amount');
-    $ref    = trim((string)$v->get('ref_number'));
-    $bank   = strtoupper(trim((string)$v->get('bank_code')));
-    $norek  = trim((string)$v->get('no_rekening'));
-    $nama   = trim((string)$v->get('nama_penerima'));
-    $ket    = trim(Req::body()['keterangan'] ?? '');
+    // ── Baca body & validasi ──────────────────────────────────────────────────
+    $body   = Req::body();
+    $errors = [];
 
-    if (Trx::byRef($ref, 'CASHOUT')) Res::ok(fmtTrx(Trx::byRef($ref, 'CASHOUT')), 'Sudah diproses.');
+    $amount = isset($body['amount']) ? (float)$body['amount'] : 0.0;
+    $ref    = trim((string)($body['ref_number']   ?? ''));
+    $bank   = strtoupper(trim((string)($body['bank_code']     ?? '')));
+    $norek  = trim((string)($body['no_rekening']  ?? ''));
+    $nama   = strtoupper(trim((string)($body['nama_penerima'] ?? '')));
+    $ket    = trim((string)($body['keterangan']   ?? ''));
+
+    if (!isset($body['amount']) || $body['amount'] === '' || $body['amount'] === null)
+        $errors[] = "Field 'amount' wajib diisi.";
+    elseif ($amount < MIN_TRX_AMOUNT)
+        $errors[] = 'Amount minimal ' . rupiah(MIN_TRX_AMOUNT) . '.';
+    elseif ($amount > MAX_CASHOUT_AMOUNT)
+        $errors[] = 'Amount maksimal ' . rupiah(MAX_CASHOUT_AMOUNT) . '.';
+
+    if ($ref   === '') $errors[] = "Field 'ref_number' wajib diisi.";
+    if ($bank  === '') $errors[] = "Field 'bank_code' wajib diisi.";
+    if ($norek === '') $errors[] = "Field 'no_rekening' wajib diisi.";
+    if ($nama  === '') $errors[] = "Field 'nama_penerima' wajib diisi.";
+
+    if ($errors) Res::err('Validasi gagal.', 422, $errors);
+
+    // ── Idempoten: cek duplikat ref ───────────────────────────────────────────
+    $existing = Trx::byRef($ref, 'CASHOUT');
+    if ($existing) Res::ok(fmtTrx($existing), 'Sudah diproses (idempoten).');
+
+    // ── Rate limit ────────────────────────────────────────────────────────────
     RateLimit::check("cashout:$code", 5, 60);
 
-    $fee    = (float)(Setting::get('dwallet.fee_cashout') ?? FEE_CASHOUT_DEFAULT);
+    // ── Hitung fee & gross ────────────────────────────────────────────────────
+    $feeRaw = Setting::get('dwallet.fee_cashout');
+    $fee    = ($feeRaw !== null && $feeRaw !== '') ? (float)$feeRaw : (float)FEE_CASHOUT_DEFAULT;
     $gross  = $amount + $fee;
+
+    // ── Cek saldo sebelum mulai transaksi ─────────────────────────────────────
+    $wallet = Wallet::getOrCreate($code);
+    if ((float)$wallet['balance'] < $gross)
+        Res::err(sprintf('Saldo tidak mencukupi. Saldo: %s, Dibutuhkan: %s (amount + fee %s).',
+            rupiah((float)$wallet['balance']), rupiah($gross), rupiah($fee)), 422);
+
+    // ── Buat nomor faktur ─────────────────────────────────────────────────────
     $faktur = Numbering::next(PREFIX_CASHOUT);
 
+    // ── Transaksi DB ──────────────────────────────────────────────────────────
     DB::begin();
     try {
         Wallet::debit($code, $gross);
-        Trx::create(['faktur' => $faktur, 'jenis' => 'CASHOUT', 'kode_sender' => $code,
-            'amount' => $amount, 'fee' => $fee, 'gross_amount' => $gross,
-            'keterangan' => $ket ?: "CashOut ke $bank/$norek", 'ref_number' => $ref,
-            'status' => ST_PROCESSING,
-            'meta' => ['bank_code' => $bank, 'no_rekening' => $norek, 'nama_penerima' => $nama]]);
-        Journal::post($faktur, 'CASHOUT', Journal::cashOut($amount, $fee));
-        DB::insert(
-            "INSERT INTO pulsa_penjualan
-                 (KodePro,NomorDepositCustomer,NomorTujuan,Produk,Status,JenisTrx,Harga,Keterangan,Tgl)
-             VALUES (?,?,?,'CASHOUT',?,'13',?,?,NOW())",
-            [$code, $faktur, $norek, ST_PROCESSING, $gross, "CashOut $bank/$norek a/n $nama"]
-        );
-        DB::commit();
-    } catch (Throwable $e) { DB::rollback(); Log::error("CashOut FAIL: " . $e->getMessage()); throw $e; }
 
+        Trx::create([
+            'faktur'       => $faktur,
+            'jenis'        => 'CASHOUT',
+            'kode_sender'  => $code,
+            'amount'       => $amount,
+            'fee'          => $fee,
+            'gross_amount' => $gross,
+            'keterangan'   => $ket ?: "CashOut ke $bank/$norek",
+            'ref_number'   => $ref,
+            'status'       => ST_PROCESSING,
+            'meta'         => ['bank_code' => $bank, 'no_rekening' => $norek, 'nama_penerima' => $nama],
+        ]);
+
+        Journal::post($faktur, 'CASHOUT', Journal::cashOut($amount, $fee));
+
+        // pulsa_penjualan — opsional, jangan batalkan transaksi jika gagal
+        try {
+            DB::insert(
+                "INSERT INTO pulsa_penjualan
+                     (KodePro,NomorDepositCustomer,NomorTujuan,Produk,Status,JenisTrx,Harga,Keterangan,Tgl)
+                 VALUES (?,?,?,'CASHOUT',?,'13',?,?,NOW())",
+                [$code, $faktur, $norek, ST_PROCESSING, $gross, "CashOut $bank/$norek a/n $nama"]
+            );
+        } catch (Throwable $pe) {
+            error_log('[DWallet][CashOut] pulsa_penjualan INSERT skip: ' . $pe->getMessage());
+        }
+
+        DB::commit();
+    } catch (Throwable $e) {
+        DB::rollback();
+        error_log('[DWallet][CashOut] DB fail: ' . $e->getMessage());
+        Res::err('Gagal menyimpan transaksi: ' . $e->getMessage(), 500);
+    }
+
+    // ── Disbursement ke payment processor ────────────────────────────────────
     $dr = disburse($bank, $norek, $nama, $amount, $faktur);
     if ($dr['success']) {
-        Trx::updateStatus($faktur, ST_SUCCESS, $dr['provider_ref']);
-        DB::exec("UPDATE pulsa_penjualan SET Status=? WHERE NomorDepositCustomer=?", [ST_SUCCESS, $faktur]);
+        Trx::updateStatus($faktur, ST_SUCCESS, $dr['provider_ref'] ?? null);
+        try { DB::exec("UPDATE pulsa_penjualan SET Status=? WHERE NomorDepositCustomer=?", [ST_SUCCESS, $faktur]); }
+        catch (Throwable) {}
     } else {
-        Wallet::credit($code, $gross);
-        Trx::updateStatus($faktur, ST_FAILED, $dr['message']);
-        DB::exec("UPDATE pulsa_penjualan SET Status=? WHERE NomorDepositCustomer=?", [ST_FAILED, $faktur]);
+        // Kembalikan saldo karena disbursement gagal
+        try {
+            Wallet::credit($code, $gross);
+            Trx::updateStatus($faktur, ST_FAILED, $dr['message'] ?? 'Disbursement gagal');
+            try { DB::exec("UPDATE pulsa_penjualan SET Status=? WHERE NomorDepositCustomer=?", [ST_FAILED, $faktur]); }
+            catch (Throwable) {}
+        } catch (Throwable $re) {
+            error_log('[DWallet][CashOut] Rollback kredit gagal: ' . $re->getMessage());
+        }
         Res::err('Penarikan gagal: ' . ($dr['message'] ?? 'Error payment processor.'), 502);
     }
 
     Log::info("CashOut OK: $faktur | $code | Rp$amount");
     Log::audit('DWallet', 'cashout', "CashOut $faktur Rp$amount → $bank/$norek", (int)$cust['id']);
-    Res::ok(array_merge(fmtTrx(Trx::byFaktur($faktur)), [
-        'bank_code' => $bank, 'no_rekening' => $norek, 'nama_penerima' => $nama,
-        'fee' => $fee, 'provider_ref' => $dr['provider_ref'] ?? null, 'waktu' => date('c'),
-    ]), 'Cash Out berhasil.', 201);
+
+    $trxResult = Trx::byFaktur($faktur);
+    Res::ok(array_merge(
+        $trxResult ? fmtTrx($trxResult) : ['faktur' => $faktur],
+        [
+            'bank_code'    => $bank,
+            'no_rekening'  => $norek,
+            'nama_penerima'=> $nama,
+            'fee'          => $fee,
+            'gross'        => $gross,
+            'provider_ref' => $dr['provider_ref'] ?? null,
+            'waktu'        => date('c'),
+        ]
+    ), 'Cash Out berhasil.', 201);
 }
 
 function apiTransfer(): void
@@ -1242,18 +1382,40 @@ if ($DWALLET_IS_API) {
     }
 
     try {
+        // Buang output apapun yang mungkin bocor sebelum handler jalan
+        $leaked = ob_get_clean();
+        ob_start();
+        if (!empty($leaked)) {
+            // Ada output bocor (misal: dari framework) — log tapi jangan tampilkan
+            error_log('[DWallet] Leaked output before ' . $DWALLET_ACTION . ': ' . substr($leaked, 0, 200));
+        }
         $fn();
+        // Handler selesai — flush buffer bersih ke client
+        $out = ob_get_clean();
+        echo $out;
     } catch (PDOException $e) {
-        Log::error('DBError: ' . $e->getMessage());
         if (DB::inTx()) DB::rollback();
-        Res::err('Kesalahan database. Hubungi administrator.', 500);
+        ob_end_clean();
+        error_log('[DWallet][DBError] ' . $e->getMessage());
+        http_response_code(500);
+        echo json_encode(['success' => false,
+            'message' => 'Kesalahan database: ' . $e->getMessage(),
+            'code'    => (int)$e->getCode(),
+        ], JSON_UNESCAPED_UNICODE);
     } catch (RuntimeException $e) {
         if (DB::inTx()) DB::rollback();
-        Res::err($e->getMessage(), 422);
+        ob_end_clean();
+        http_response_code(422);
+        echo json_encode(['success' => false, 'message' => $e->getMessage()], JSON_UNESCAPED_UNICODE);
     } catch (Throwable $e) {
-        Log::error('Unhandled: ' . $e->getMessage(), ['file' => basename($e->getFile()), 'line' => $e->getLine()]);
         if (DB::inTx()) DB::rollback();
-        Res::err('Kesalahan internal. Coba beberapa saat lagi.', 500);
+        ob_end_clean();
+        error_log('[DWallet][Unhandled] ' . $e->getMessage() . ' @ ' . $e->getFile() . ':' . $e->getLine());
+        http_response_code(500);
+        echo json_encode(['success' => false,
+            'message' => $e->getMessage(),
+            'trace'   => basename($e->getFile()) . ':' . $e->getLine(),
+        ], JSON_UNESCAPED_UNICODE);
     }
     exit;
 }
@@ -2123,10 +2285,22 @@ async function call(action) {
 
   try {
     const resp = await fetch(url, opts);
-    const data = await resp.json().catch(() => ({ _raw: 'Non-JSON response' }));
-    showResult(action, data, resp.ok);
+    const rawText = await resp.text();
+    let data;
+    try {
+      data = JSON.parse(rawText);
+    } catch (_) {
+      // Server tidak mengembalikan JSON — tampilkan raw body untuk debug
+      data = {
+        _error       : 'Response bukan JSON',
+        _http_status : resp.status,
+        _content_type: resp.headers.get('content-type') || '(kosong)',
+        _raw_body    : rawText.substring(0, 2000),
+      };
+    }
+    showResult(action, data, resp.ok && (data.success !== false));
   } catch (e) {
-    showResult(action, { error: e.message, url }, false);
+    showResult(action, { _error: e.message, _url: url }, false);
   }
 }
 
@@ -2146,3 +2320,6 @@ async function doInstall() {
 </script>
 </body>
 </html>
+<?php
+// Flush buffer Web UI ke client
+if (ob_get_level() > 0) ob_end_flush();
