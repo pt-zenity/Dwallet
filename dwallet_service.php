@@ -22,7 +22,7 @@
  *   http://assist.gw.sis1.net/mod/dwallet/v1/api/
  *   http://assist.gw.sis1.net/mod/dwallet/v1/api/?ui
  *
- * @version  3.3.0
+ * @version  3.4.0
  * @base-url http://assist.gw.sis1.net
  * ============================================================================
  */
@@ -80,7 +80,7 @@ const CFG_COA_FEE       = '411001';
 const CFG_COA_EXPENSE   = '511001';
 
 // ── Versi ─────────────────────────────────────────────────────────────────────
-const DWALLET_VERSION   = '3.3.0';
+const DWALLET_VERSION   = '3.4.0';
 const DWALLET_TIMEZONE  = CFG_TIMEZONE;
 
 // ── Alias konstanta internal ──────────────────────────────────────────────────
@@ -1226,6 +1226,8 @@ if ($DWALLET_IS_API) {
         'install'   => ['apiInstall',   ['GET','POST']],
         'customers' => ['apiCustomers', ['GET']],
     ];
+    // Endpoint 'customers' boleh dipanggil langsung dari browser tanpa Bearer
+    // (data sudah di-embed di HTML, endpoint ini hanya fallback/debug)
 
     [$fn, $allowed] = $map[$DWALLET_ACTION];
     if (!in_array($method, $allowed, true)) {
@@ -1282,7 +1284,8 @@ $dbErr     = '';
 $stats     = ['trx_today' => 0, 'trx_total' => 0, 'wallet_total' => 0,
               'vol_today' => 0.0, 'vol_total' => 0.0, 'pending_count' => 0];
 $recentTrx = [];
-$topWallet = [];
+$topWallet  = [];
+$customers  = [];
 
 try {
     DB::scalar('SELECT 1');
@@ -1310,6 +1313,22 @@ try {
          LEFT JOIN customer c ON c.KodePro = w.customer_code
          ORDER BY w.balance DESC LIMIT 10"
     );
+
+    // Ambil daftar customer untuk dropdown global token selector
+    $custRows  = DB::fetch(
+        "SELECT Kode, KodePro, name, api_token, status
+         FROM customer
+         WHERE api_token IS NOT NULL AND api_token != ''
+         ORDER BY name ASC LIMIT 500"
+    );
+    foreach ($custRows as $cr) {
+        $customers[] = [
+            'kode'      => $cr['KodePro'] ?: $cr['Kode'],
+            'nama'      => $cr['name'],
+            'api_token' => $cr['api_token'],
+            'status'    => $cr['status'] ?? 'active',
+        ];
+    }
 } catch (Throwable $e) {
     $dbErr = $e->getMessage();
 }
@@ -1539,7 +1558,7 @@ pre.api{background:#0f172a;color:#e2e8f0;padding:14px;border-radius:8px;font-siz
       <select id="global-customer" onchange="onCustomerChange(this)" style="flex:1;border:none;outline:none;font-size:12px;color:#1a202c;background:transparent;cursor:pointer">
         <option value="">-- Pilih Customer --</option>
       </select>
-      <button onclick="loadCustomers()" title="Refresh daftar customer" style="border:none;background:none;cursor:pointer;font-size:14px;padding:0">🔄</button>
+      <button onclick="location.reload()" title="Refresh halaman untuk reload daftar customer" style="border:none;background:none;cursor:pointer;font-size:14px;padding:0">🔄</button>
     </div>
     <div class="meta"><?= $now ?><br><?= htmlspecialchars($baseUrl) ?></div>
   </div>
@@ -2006,30 +2025,33 @@ function onCustomerChange(sel) {
   setGlobalToken(opt.dataset.token, opt.value, opt.dataset.nama);
 }
 
-async function loadCustomers() {
+// Data customer di-embed dari PHP saat render (tidak perlu fetch terpisah)
+const CUSTOMERS_DATA = <?= json_encode($customers, JSON_UNESCAPED_UNICODE) ?>;
+
+function loadCustomers() {
   const sel = document.getElementById('global-customer');
-  sel.innerHTML = '<option value="">⏳ Loading...</option>';
-  try {
-    const r = await fetch(BASE + '?action=customers');
-    const d = await r.json();
-    const list = d.data?.customers || [];
-    sel.innerHTML = '<option value="">-- Pilih Customer --</option>';
-    list.forEach(c => {
-      const opt = document.createElement('option');
-      opt.value          = c.kode;
-      opt.dataset.token  = c.api_token;
-      opt.dataset.nama   = c.nama;
-      const statusIcon   = c.status === 'active' ? '🟢' : '🔴';
-      opt.textContent    = `${statusIcon} ${c.kode} — ${c.nama}`;
-      sel.appendChild(opt);
-    });
-    if (list.length === 0) sel.innerHTML = '<option value="">Tidak ada customer dengan token</option>';
-  } catch(e) {
-    sel.innerHTML = '<option value="">⚠️ Gagal memuat customer</option>';
+  sel.innerHTML = '<option value="">-- Pilih Customer --</option>';
+  if (!CUSTOMERS_DATA || CUSTOMERS_DATA.length === 0) {
+    const opt = document.createElement('option');
+    opt.value = ''; opt.disabled = true;
+    opt.textContent = dbOk ? 'Tidak ada customer dengan token' : '⚠️ Database tidak terhubung';
+    sel.appendChild(opt);
+    return;
   }
+  CUSTOMERS_DATA.forEach(c => {
+    const opt       = document.createElement('option');
+    opt.value       = c.kode;
+    opt.dataset.token = c.api_token;
+    opt.dataset.nama  = c.nama;
+    const icon      = c.status === 'active' ? '🟢' : '🔴';
+    opt.textContent = `${icon} ${c.kode} — ${c.nama}`;
+    sel.appendChild(opt);
+  });
 }
 
-// Auto-load customer saat halaman siap
+const dbOk = <?= $dbOk ? 'true' : 'false' ?>;
+
+// Populate dropdown saat halaman siap
 document.addEventListener('DOMContentLoaded', loadCustomers);
 
 // ── Navigation ─────────────────────────────────────────────────────────────
