@@ -22,7 +22,7 @@
  *   http://assist.gw.sis1.net/mod/dwallet/v1/api/
  *   http://assist.gw.sis1.net/mod/dwallet/v1/api/?ui
  *
- * @version  3.2.0
+ * @version  3.3.0
  * @base-url http://assist.gw.sis1.net
  * ============================================================================
  */
@@ -80,7 +80,7 @@ const CFG_COA_FEE       = '411001';
 const CFG_COA_EXPENSE   = '511001';
 
 // ── Versi ─────────────────────────────────────────────────────────────────────
-const DWALLET_VERSION   = '3.2.0';
+const DWALLET_VERSION   = '3.3.0';
 const DWALLET_TIMEZONE  = CFG_TIMEZONE;
 
 // ── Alias konstanta internal ──────────────────────────────────────────────────
@@ -161,7 +161,7 @@ $DWALLET_ACTION = _dwDetectAction();
 // ── Tentukan apakah ini request API atau UI ───────────────────────────────────
 $DWALLET_API_ACTIONS = [
     'balance','cashin','cashout','transfer','payment',
-    'refund','inquiry','history','callback','health','install',
+    'refund','inquiry','history','callback','health','install','customers',
 ];
 $DWALLET_IS_API = in_array($DWALLET_ACTION, $DWALLET_API_ACTIONS, true);
 
@@ -1099,6 +1099,26 @@ function apiHealth(): void
     exit;
 }
 
+function apiCustomers(): void
+{
+    // Hanya bisa dipanggil dari Web UI (same-origin). Tidak perlu Bearer.
+    // Kembalikan daftar customer (kode + nama + api_token) untuk dropdown.
+    $rows = DB::fetch(
+        "SELECT Kode, KodePro, name, email, api_token, status
+         FROM customer
+         WHERE api_token IS NOT NULL AND api_token != ''
+         ORDER BY name ASC LIMIT 500"
+    );
+    $list = array_map(fn($r) => [
+        'kode'      => $r['KodePro'] ?: $r['Kode'],
+        'nama'      => $r['name'],
+        'email'     => $r['email'] ?? '',
+        'api_token' => $r['api_token'],
+        'status'    => $r['status'] ?? 'active',
+    ], $rows);
+    Res::ok(['customers' => $list, 'total' => count($list)]);
+}
+
 function apiInstall(): void
 {
     $secret  = $_GET['secret'] ?? $_POST['secret'] ?? '';
@@ -1203,7 +1223,8 @@ if ($DWALLET_IS_API) {
         'history'  => ['apiHistory',  ['GET','POST']],
         'callback' => ['apiCallback', ['POST']],
         'health'   => ['apiHealth',   ['GET','POST']],
-        'install'  => ['apiInstall',  ['GET','POST']],
+        'install'   => ['apiInstall',   ['GET','POST']],
+        'customers' => ['apiCustomers', ['GET']],
     ];
 
     [$fn, $allowed] = $map[$DWALLET_ACTION];
@@ -1463,6 +1484,10 @@ a.nav .ic{width:17px;text-align:center;font-size:14px}
 /* Sections */
 .sec{display:none} .sec.on{display:block}
 
+/* Global token bar */
+#active-token-bar{transition:all .2s}
+#tok-box select option[value=""]{color:#94a3b8}
+
 /* DB info table */
 .dbt{width:100%;border-collapse:collapse;font-size:12px}
 .dbt th{background:#f8fafc;padding:7px 10px;text-align:left;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:#94a3b8;border-bottom:2px solid #e2e8f0;font-size:10px}
@@ -1507,7 +1532,23 @@ pre.api{background:#0f172a;color:#e2e8f0;padding:14px;border-radius:8px;font-siz
 <main class="main">
 <div class="topbar">
   <h2 id="sec-title">📊 Dashboard</h2>
-  <div class="meta"><?= $now ?><br><?= htmlspecialchars($baseUrl) ?></div>
+  <div style="display:flex;align-items:center;gap:10px">
+    <!-- ── Global Customer/Token Selector ── -->
+    <div id="tok-box" style="background:#fff;border:1.5px solid #e2e8f0;border-radius:10px;padding:8px 12px;display:flex;align-items:center;gap:8px;box-shadow:0 1px 3px rgba(0,0,0,.06);min-width:280px">
+      <span style="font-size:13px;color:#64748b;white-space:nowrap">🔑 Customer:</span>
+      <select id="global-customer" onchange="onCustomerChange(this)" style="flex:1;border:none;outline:none;font-size:12px;color:#1a202c;background:transparent;cursor:pointer">
+        <option value="">-- Pilih Customer --</option>
+      </select>
+      <button onclick="loadCustomers()" title="Refresh daftar customer" style="border:none;background:none;cursor:pointer;font-size:14px;padding:0">🔄</button>
+    </div>
+    <div class="meta"><?= $now ?><br><?= htmlspecialchars($baseUrl) ?></div>
+  </div>
+</div>
+<!-- Token aktif (hidden, dibaca JS) -->
+<div id="active-token-bar" style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:6px 14px;margin-bottom:14px;font-size:12px;display:none;align-items:center;gap:8px">
+  <span style="color:#166534">✅ Token aktif:</span>
+  <code id="active-token-display" style="color:#065f46;font-size:11px"></code>
+  <button onclick="clearGlobalToken()" style="margin-left:auto;border:none;background:none;cursor:pointer;color:#dc2626;font-size:12px">✕ Clear</button>
 </div>
 
 <!-- ══ DASHBOARD ══ -->
@@ -1916,6 +1957,81 @@ GET <?= htmlspecialchars($baseUrl) ?>?action=inquiry&amp;ref_number=REF-001
 <script>
 const BASE = '<?= addslashes($baseUrl) ?>';
 
+// ══════════════════════════════════════════════════
+// GLOBAL TOKEN — otomatis isi semua field token
+// ══════════════════════════════════════════════════
+let _globalToken = '';
+let _globalKode  = '';
+
+// Peta: setiap action → id input token-nya
+const TOKEN_IDS = {
+  balance:'b-tok', cashin:'ci-tok', cashout:'co-tok', transfer:'tf-tok',
+  payment:'py-tok', refund:'rf-tok', inquiry:'iq-tok', history:'hs-tok',
+};
+
+function setGlobalToken(token, kode, nama) {
+  _globalToken = token;
+  _globalKode  = kode;
+  // Isi semua input token
+  Object.values(TOKEN_IDS).forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.value = token;
+  });
+  // Tampilkan bar
+  const bar = document.getElementById('active-token-bar');
+  const disp = document.getElementById('active-token-display');
+  if (token) {
+    bar.style.display = 'flex';
+    disp.textContent  = `${kode} — ${nama} → ${token}`;
+  } else {
+    bar.style.display = 'none';
+    disp.textContent  = '';
+  }
+}
+
+function clearGlobalToken() {
+  _globalToken = '';
+  _globalKode  = '';
+  document.getElementById('global-customer').value = '';
+  Object.values(TOKEN_IDS).forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.value = '';
+  });
+  document.getElementById('active-token-bar').style.display = 'none';
+}
+
+function onCustomerChange(sel) {
+  const opt = sel.options[sel.selectedIndex];
+  if (!opt || !opt.value) { clearGlobalToken(); return; }
+  setGlobalToken(opt.dataset.token, opt.value, opt.dataset.nama);
+}
+
+async function loadCustomers() {
+  const sel = document.getElementById('global-customer');
+  sel.innerHTML = '<option value="">⏳ Loading...</option>';
+  try {
+    const r = await fetch(BASE + '?action=customers');
+    const d = await r.json();
+    const list = d.data?.customers || [];
+    sel.innerHTML = '<option value="">-- Pilih Customer --</option>';
+    list.forEach(c => {
+      const opt = document.createElement('option');
+      opt.value          = c.kode;
+      opt.dataset.token  = c.api_token;
+      opt.dataset.nama   = c.nama;
+      const statusIcon   = c.status === 'active' ? '🟢' : '🔴';
+      opt.textContent    = `${statusIcon} ${c.kode} — ${c.nama}`;
+      sel.appendChild(opt);
+    });
+    if (list.length === 0) sel.innerHTML = '<option value="">Tidak ada customer dengan token</option>';
+  } catch(e) {
+    sel.innerHTML = '<option value="">⚠️ Gagal memuat customer</option>';
+  }
+}
+
+// Auto-load customer saat halaman siap
+document.addEventListener('DOMContentLoaded', loadCustomers);
+
 // ── Navigation ─────────────────────────────────────────────────────────────
 const TITLES = {
   dashboard:'📊 Dashboard', balance:'💰 Balance', cashin:'⬇️ Cash In',
@@ -1953,18 +2069,24 @@ function showResult(id, data, ok) {
 async function call(action) {
   let token = '', body = {}, method = 'POST', qs = '';
 
-  if (action === 'balance')   { token = g('b-tok'); }
-  else if (action === 'cashin')    { token = g('ci-tok'); body = { amount: +g('ci-amt'), ref_number: g('ci-ref'), channel: g('ci-ch') }; }
-  else if (action === 'cashout')   { token = g('co-tok'); body = { amount: +g('co-amt'), ref_number: g('co-ref'), bank_code: g('co-bank'), no_rekening: g('co-rek'), nama_penerima: g('co-nama').toUpperCase(), keterangan: g('co-ket') }; }
-  else if (action === 'transfer')  { token = g('tf-tok'); body = { amount: +g('tf-amt'), kode_penerima: g('tf-kode'), ref_number: g('tf-ref'), keterangan: g('tf-ket') }; }
-  else if (action === 'payment')   { token = g('py-tok'); body = { amount: +g('py-amt'), ref_number: g('py-ref'), kode_produk: g('py-prod'), nomor_tujuan: g('py-tuj'), keterangan: g('py-ket') }; }
-  else if (action === 'refund')    { token = g('rf-tok'); body = { faktur_asal: g('rf-fak'), alasan: g('rf-alasan') }; }
-  else if (action === 'inquiry')   { token = g('iq-tok'); method = 'GET'; const f=g('iq-fak'),r=g('iq-ref'); qs = f ? '&faktur='+encodeURIComponent(f) : '&ref_number='+encodeURIComponent(r); }
-  else if (action === 'history')   { token = g('hs-tok'); method = 'GET'; const p = new URLSearchParams(); if(g('hs-page')) p.set('page',g('hs-page')); if(g('hs-pp')) p.set('per_page',g('hs-pp')); if(g('hs-jenis')) p.set('jenis',g('hs-jenis')); if(g('hs-dari')) p.set('dari',g('hs-dari')); if(g('hs-sampai')) p.set('sampai',g('hs-sampai')); qs = '&'+p.toString(); }
+  // Ambil token: dari field per-action ATAU dari global selector
+  function getToken(fieldId) {
+    const val = g(fieldId);
+    return val || _globalToken;  // field manual override global
+  }
+
+  if (action === 'balance')        { token = getToken('b-tok'); }
+  else if (action === 'cashin')    { token = getToken('ci-tok'); body = { amount: +g('ci-amt'), ref_number: g('ci-ref'), channel: g('ci-ch') }; }
+  else if (action === 'cashout')   { token = getToken('co-tok'); body = { amount: +g('co-amt'), ref_number: g('co-ref'), bank_code: g('co-bank'), no_rekening: g('co-rek'), nama_penerima: g('co-nama').toUpperCase(), keterangan: g('co-ket') }; }
+  else if (action === 'transfer')  { token = getToken('tf-tok'); body = { amount: +g('tf-amt'), kode_penerima: g('tf-kode'), ref_number: g('tf-ref'), keterangan: g('tf-ket') }; }
+  else if (action === 'payment')   { token = getToken('py-tok'); body = { amount: +g('py-amt'), ref_number: g('py-ref'), kode_produk: g('py-prod'), nomor_tujuan: g('py-tuj'), keterangan: g('py-ket') }; }
+  else if (action === 'refund')    { token = getToken('rf-tok'); body = { faktur_asal: g('rf-fak'), alasan: g('rf-alasan') }; }
+  else if (action === 'inquiry')   { token = getToken('iq-tok'); method = 'GET'; const f=g('iq-fak'),r=g('iq-ref'); qs = f ? '&faktur='+encodeURIComponent(f) : '&ref_number='+encodeURIComponent(r); }
+  else if (action === 'history')   { token = getToken('hs-tok'); method = 'GET'; const p = new URLSearchParams(); if(g('hs-page')) p.set('page',g('hs-page')); if(g('hs-pp')) p.set('per_page',g('hs-pp')); if(g('hs-jenis')) p.set('jenis',g('hs-jenis')); if(g('hs-dari')) p.set('dari',g('hs-dari')); if(g('hs-sampai')) p.set('sampai',g('hs-sampai')); qs = '&'+p.toString(); }
   else if (action === 'health')    { method = 'GET'; }
 
   if (!token && action !== 'health') {
-    showResult(action, { error: 'Bearer Token wajib diisi' }, false); return;
+    showResult(action, { error: '❌ Bearer Token kosong. Pilih customer dari dropdown atas, atau isi manual.' }, false); return;
   }
 
   const url  = BASE + '?action=' + action + qs;
